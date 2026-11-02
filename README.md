@@ -1,28 +1,46 @@
 # K-Bridge
 
-ESP32-based passive serial tap that decodes UART and CAN bus traffic from embedded devices without modifying or interrupting them. Streams decoded frames to a React dashboard over WebSocket.
+An ESP32 tool for listening in on the communication inside embedded devices. It passively taps UART and CAN bus traffic, decodes the frames, and streams them live to a React dashboard over WebSocket. It never transmits on the line it's tapping.
 
-Built it originally to reverse-engineer the communication protocol on a commercial gym elliptical machine. Ended up being useful enough that I added OBD-II CAN support for tapping vehicle ECU data too.
+I built it to reverse-engineer the undocumented serial protocol of a commercial gym elliptical. Then I added OBD-II support so it could also read live engine data from a car's CAN bus.
 
-## What it can do
+## What it does
 
-**UART tap:** Connect to any device's TX line (no TX from the ESP32 — purely passive listen). Supports ASCII framing and binary frame decoding once you know the sync byte and byte layout.
+- **UART tap:** listens on a device's TX line only. The ESP32's own TX is never connected, so it can't interfere. Handles ASCII text and binary frames once you know the sync byte and byte layout.
+- **CAN tap (OBD-II):** an MCP2515 CAN controller in listen-only mode, so it never puts anything on the bus. Decodes standard OBD-II values (RPM, speed, coolant temp, throttle, engine load) and shows raw frames for everything else.
+- **Live dashboard:** React + Vite. A live frame stream with decoded values, OBD metric cards that update in real time, and a control to change the UART baud rate without reflashing.
 
-**CAN tap (OBD-II):** MCP2515 in listen-only mode, so it never puts anything on the bus. Decodes standard OBD-II PIDs (RPM, speed, coolant temp, throttle, load) and shows raw frames for everything else.
+## Architecture
 
-The React dashboard shows a live frame stream with decoded values, lets you switch UART baud rate on the fly, and shows OBD metric cards that update in real time.
+The firmware runs three FreeRTOS tasks connected by a queue, so capturing data is separate from sending it:
+
+```
+UART task (core 1) --\
+                      +--> frame queue --> WebSocket task (core 0) --> dashboard
+CAN task  (core 1) --/
+```
+
+- **UART task** reads bytes from the tapped line, decodes them, and puts frames in the queue.
+- **CAN task** reads frames from the MCP2515, decodes OBD-II responses, and puts them in the queue.
+- **WebSocket task** takes frames from the queue, sends them out as JSON, and handles commands from the dashboard, such as changing the baud rate.
+
+Capture runs on one core and networking on the other, so WiFi traffic doesn't make the tap miss data.
+
+## Reverse-engineering the elliptical
+
+There was no datasheet. I tapped the elliptical's UART line with a logic analyzer, changed resistance and speed on the machine, and watched which bytes changed. That gave me the sync byte and the frame layout, which I then decoded in `decodeUARTFrame()`.
 
 ## Hardware
 
 - ESP32 DevKit
 - MCP2515 CAN module (SPI)
-- OBD-II cable or direct CANH/CANL connection
+- OBD-II cable, or a direct CANH/CANL connection
 
 ## Wiring
 
 ```
 UART tap:
-  Target device TX -> GPIO16  (RX2, passive only — do NOT connect ESP32 TX)
+  Target device TX -> GPIO16  (RX2, passive only. Do NOT connect ESP32 TX)
   GND              -> GND
 
 MCP2515 (CAN):
@@ -41,16 +59,16 @@ OBD-II connector:
 
 ## Firmware
 
-Arduino IDE, ESP32 board package.
+Arduino IDE with the ESP32 board package. The source is in `firmware/k_bridge.ino`.
 
-**Libraries:**
+Libraries:
 - `WebSocketsServer` (Links2004/arduinoWebSockets)
 - `ArduinoJson`
 - `arduino-mcp2515` (autowp/arduino-mcp2515)
 
-Set `UART_BAUD` in `k_bridge.ino` to match your target device. The CAN bitrate is hardcoded to 500kbps (standard for most vehicles) — change `CAN_500KBPS` if yours is different.
+Set `UART_BAUD` to match your target device. The CAN bitrate is 500 kbps, the standard for most vehicles. Change `CAN_500KBPS` if yours is different.
 
-Flash the ESP32. It creates a WiFi AP called **K-Bridge** (password: `kbridge123`). Connect your laptop to that network.
+Flash the ESP32. It creates a WiFi network called **K-Bridge**. Connect your laptop or phone to it.
 
 ## Dashboard
 
@@ -61,16 +79,14 @@ npm run dev
 # opens at http://localhost:3000
 ```
 
-The dashboard connects directly to `ws://192.168.4.1:81`. You can also open it from a phone connected to the K-Bridge AP.
+The dashboard connects to `ws://192.168.4.1:81`.
 
-## Adapting for a new device
+## Adapting it to a new device
 
-For binary UART frames, use a logic analyzer to find the sync byte and frame structure first, then update `decodeUARTFrame()` in the firmware. The current placeholder looks for `0xAA` as the sync byte — change that and the byte offsets to match your device.
+For binary UART frames, find the sync byte and frame structure with a logic analyzer first. Then update `decodeUARTFrame()` in the firmware. The default looks for `0xAA` as the sync byte.
 
-For the elliptical machine specifically, I tapped the UART line with a logic analyzer and found the frame format by looking at what changed when I adjusted resistance and speed on the machine. Then reverse-engineered the byte layout from there.
+## Next steps
 
-## TODO
-
-- Add SPI and I2C tap support
-- Save captured frames to SPIFFS for offline analysis
-- Web UI for uploading custom decoders without reflashing
+- SPI and I2C tap support
+- Saving captured frames to flash for offline analysis
+- Uploading custom decoders from the web UI without reflashing
